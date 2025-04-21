@@ -1,0 +1,4 @@
+[tool.ruff]
+line-length = 100
+ignore = ["E731", "E711", "E741", "E722"]
+exclude = ["legacy/", "rebuttal_files/"]
