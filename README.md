@@ -5,6 +5,12 @@
 Implementation of FlexDock for flexible docking and relaxation by Gabriele Corso*, Vignesh Ram Somnath*, Noah Getz*, Regina Barzilay, Tommi Jaakkola, Andreas Krause.
 This repository contains code and instructions to run the method. This codebase is under active development to make it more user-friendly and as such we expect minor bugs along the way. If you encounter any issues or have questions, feel free to open an issue!
 
+Planned Updates:
+
+- [] Clean instructions for training data pipelines for relaxation and filtering
+- [] Complete transition to configs
+- [] Mixed-Precision Training
+
 
 <details><summary><b>Citation</b></summary>
 If you use this code or model in your research, please cite the following paper:
