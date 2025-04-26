@@ -296,7 +296,7 @@ def compute_protein_alignment_metrics(
 ):
     if isinstance(pos, np.ndarray):
         pos = torch.tensor(pos, dtype=torch.float32)
-        ref_pos = torch.tensor(pos, dtype=torch.float32)
+        ref_pos = torch.tensor(ref_pos, dtype=torch.float32)
         nearby_atom_mask = torch.tensor(nearby_atom_mask, dtype=torch.bool)
         ca_mask = torch.tensor(ca_mask, dtype=torch.bool)
         c_mask = torch.tensor(c_mask, dtype=torch.bool)

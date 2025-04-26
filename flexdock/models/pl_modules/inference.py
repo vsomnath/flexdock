@@ -98,9 +98,7 @@ class InferenceModule(LightningModule):
         name = batch["name"][0]
         if self.cfg.only_run_relaxation:
             output_dir = Path(self.cfg.output_dir)
-            docking_outputs_path: Path = (
-                output_dir / name / "docking" / "predictions.pkl"
-            )
+            docking_outputs_path: Path = output_dir / name / "docking_predictions.pkl"
             if not docking_outputs_path.exists():
                 logging.info(
                     f"Skipping relaxation for complex {name} because no docking outputs found."
@@ -280,145 +278,165 @@ class InferenceModule(LightningModule):
         graph = copy.deepcopy(batch.to("cpu"))
         relaxation_outputs = {"name": batch["name"][0]}
 
-        for key in [
-            "atom_mask",
-            "pocket_atom_mask",
-            "ca_mask",
-            "filterHs",
-            "amber_subset_mask",
-        ]:
-            relaxation_outputs[key] = copy.deepcopy(outputs[key])
-        relaxation_outputs["c_mask"] = graph["atom"].c_mask
-        relaxation_outputs["n_mask"] = graph["atom"].n_mask
+        try:
+            for key in [
+                "atom_mask",
+                "pocket_atom_mask",
+                "ca_mask",
+                "filterHs",
+                "amber_subset_mask",
+            ]:
+                relaxation_outputs[key] = copy.deepcopy(outputs[key])
+            relaxation_outputs["c_mask"] = graph["atom"].c_mask
+            relaxation_outputs["n_mask"] = graph["atom"].n_mask
 
-        start_time = time.time()
-        graph["ligand"].flexdock_pos = torch.tensor(
-            np.stack(outputs["ligand_pos"]), dtype=torch.float32
-        )
-        graph["atom"].flexdock_pos = torch.tensor(
-            np.stack(outputs["atom_pos"]), dtype=torch.float32
-        )
-        graph["receptor"].flexdock_pos = graph["atom"].flexdock_pos[
-            :, graph["atom"].ca_mask
-        ]
+            start_time = time.time()
+            graph["ligand"].flexdock_pos = torch.tensor(
+                np.stack(outputs["ligand_pos"]), dtype=torch.float32
+            )
+            graph["atom"].flexdock_pos = torch.tensor(
+                np.stack(outputs["atom_pos"]), dtype=torch.float32
+            )
+            graph["receptor"].flexdock_pos = graph["atom"].flexdock_pos[
+                :, graph["atom"].ca_mask
+            ]
 
-        # No ESM-Embeddings are used?
-        graph["receptor"].x = graph["receptor"].x[:, :1]
+            # No ESM-Embeddings are used?
+            graph["receptor"].x = graph["receptor"].x[:, :1]
 
-        # Pre-Relaxation additions
-        graph["ligand"].pos = graph["ligand"].flexdock_pos
-        graph["atom"].pos = graph["atom"].flexdock_pos
-        graph["receptor"].pos = graph["atom"].pos[:, graph["atom"].ca_mask]
-        graph["atom"].nearby_atom_mask = graph["atom"].nearby_atoms
+            # Pre-Relaxation additions
+            graph["ligand"].pos = graph["ligand"].flexdock_pos
+            graph["atom"].pos = graph["atom"].flexdock_pos
+            graph["receptor"].pos = graph["atom"].pos[:, graph["atom"].ca_mask]
+            graph["atom"].nearby_atom_mask = graph["atom"].nearby_atoms
 
-        graph.n_samples = graph["ligand"].pos.shape[0]
-        graph.conf_idx = torch.arange(graph.n_samples)
+            graph.n_samples = graph["ligand"].pos.shape[0]
+            graph.conf_idx = torch.arange(graph.n_samples)
 
-        if self.relaxation_module is None:
-            relaxation_outputs["atom_pos"] = graph["atom"].flexdock_pos[0].cpu().numpy()
+            if self.relaxation_module is None:
+                relaxation_outputs["atom_pos"] = (
+                    graph["atom"].flexdock_pos[0].cpu().numpy()
+                )
+                relaxation_outputs["ligand_pos"] = (
+                    graph["ligand"].flexdock_pos[0].cpu().numpy()
+                )
+                relaxation_outputs["success"] = True
+                return relaxation_outputs
+
+            conf_dataset = IterableConfDataset(
+                graph, multiplicity=self.cfg.relax_n_conformers
+            )
+            conf_loader = DataLoader(
+                conf_dataset,
+                batch_size=self.cfg.relax_batch_size,
+                exclude_keys=["flexdock_pos"],
+            )
+
+            for batch in conf_loader:
+                batch = batch.to(self.device)
+
+                if not self.cfg.no_energy_filtering:
+                    # batch = transform(batch) # TODO: Check if this is identity
+                    pass
+
+                flexdock_lig_pos = to_dense_batch(
+                    batch["ligand"].pos.clone(), batch["ligand"].batch
+                )[0].cpu()
+                flexdock_atom_pos = to_dense_batch(
+                    batch["atom"].pos.clone(), batch["atom"].batch
+                )[0].cpu()
+
+                lig_pred_batch, atom_pred_batch = sampling_on_batch(
+                    self.relaxation_module.model,  # TODO: Check
+                    batch,
+                    self.cfg.relax_inference_steps,
+                    x_zero_pred=self.relaxation_args.x_zero_pred,
+                    save_traj=False,
+                    schedule_type=self.cfg.relax_schedule_type,
+                    schedule_param=self.cfg.relax_schedule_param,
+                )
+                lig_pred = to_dense_batch(lig_pred_batch, batch["ligand"].batch)[
+                    0
+                ].cpu()
+                atom_pred = to_dense_batch(atom_pred_batch, batch["atom"].batch)[
+                    0
+                ].cpu()
+
+                if not self.cfg.no_energy_filtering:
+                    posebusters_metrics = {}
+                    posebusters_metrics.update(
+                        compute_posebusters_geometry_metrics(
+                            lig_pred,
+                            graph[
+                                "ligand", "lig_edge", "ligand"
+                            ].posebusters_edge_index,
+                            graph["ligand", "lig_edge", "ligand"].lower_bound,
+                            graph["ligand", "lig_edge", "ligand"].upper_bound,
+                            graph["ligand", "lig_edge", "ligand"].posebusters_bond_mask,
+                            graph[
+                                "ligand", "lig_edge", "ligand"
+                            ].posebusters_angle_mask,
+                        )
+                    )
+                    posebusters_metrics.update(
+                        compute_posebusters_interaction_metrics(
+                            lig_pred,
+                            atom_pred,
+                            graph["ligand"].vdw_radii,
+                            graph["atom"].vdw_radii,
+                        )
+                    )
+                    posebusters_passes = np.all(
+                        np.stack(list(posebusters_metrics.values())), axis=0
+                    )
+
+                    if posebusters_passes.sum() > 0:
+                        lig_pred, atom_pred = (
+                            lig_pred[posebusters_passes],
+                            atom_pred[posebusters_passes],
+                        )
+                        flexdock_lig_pos, flexdock_atom_pos = (
+                            flexdock_lig_pos[posebusters_passes],
+                            flexdock_atom_pos[posebusters_passes],
+                        )
+                    else:
+                        continue
+
+                if not self.cfg.no_rmsd_filtering:
+                    R, tr = rigid_transform_kabsch(
+                        atom_pred[:, graph["atom"].nearby_atom_mask],
+                        flexdock_atom_pos[:, graph["atom"].nearby_atom_mask],
+                    )
+                    lig_pred = lig_pred @ R.swapaxes(-1, -2) + tr.unsqueeze(-2)
+                    atom_pred = atom_pred @ R.swapaxes(-1, -2) + tr.unsqueeze(-2)
+                    lig_rmsds = torch.mean(
+                        torch.sum((lig_pred - flexdock_lig_pos) ** 2, dim=-1), dim=-1
+                    )
+                    atom_rmsds = torch.mean(
+                        torch.sum((atom_pred - flexdock_atom_pos) ** 2, dim=-1), dim=-1
+                    )
+                    rmsds = (lig_rmsds + atom_rmsds) / 2
+                    pred_idx = torch.argmin(rmsds).squeeze()
+                else:
+                    pred_idx = 0
+
+                relaxation_outputs["ligand_pos"] = lig_pred[pred_idx].cpu().numpy()
+                relaxation_outputs["atom_pos"] = atom_pred[pred_idx].cpu().numpy()
+                relaxation_outputs["success"] = True
+                relaxation_outputs["run_time"] = time.time() - start_time
+                return relaxation_outputs
+
             relaxation_outputs["ligand_pos"] = (
                 graph["ligand"].flexdock_pos[0].cpu().numpy()
             )
-            relaxation_outputs["success"] = True
-            return relaxation_outputs
-
-        conf_dataset = IterableConfDataset(
-            graph, multiplicity=self.cfg.relax_n_conformers
-        )
-        conf_loader = DataLoader(
-            conf_dataset,
-            batch_size=self.cfg.relax_batch_size,
-            exclude_keys=["flexdock_pos"],
-        )
-
-        for batch in conf_loader:
-            batch = batch.to(self.device)
-
-            if not self.cfg.no_energy_filtering:
-                # batch = transform(batch) # TODO: Check if this is identity
-                pass
-
-            flexdock_lig_pos = to_dense_batch(
-                batch["ligand"].pos.clone(), batch["ligand"].batch
-            )[0].cpu()
-            flexdock_atom_pos = to_dense_batch(
-                batch["atom"].pos.clone(), batch["atom"].batch
-            )[0].cpu()
-
-            lig_pred_batch, atom_pred_batch = sampling_on_batch(
-                self.relaxation_module.model,  # TODO: Check
-                batch,
-                self.cfg.relax_inference_steps,
-                x_zero_pred=self.relaxation_args.x_zero_pred,
-                save_traj=False,
-                schedule_type=self.cfg.relax_schedule_type,
-                schedule_param=self.cfg.relax_schedule_param,
-            )
-            lig_pred = to_dense_batch(lig_pred_batch, batch["ligand"].batch)[0].cpu()
-            atom_pred = to_dense_batch(atom_pred_batch, batch["atom"].batch)[0].cpu()
-
-            if not self.cfg.no_energy_filtering:
-                posebusters_metrics = {}
-                posebusters_metrics.update(
-                    compute_posebusters_geometry_metrics(
-                        lig_pred,
-                        graph["ligand", "lig_edge", "ligand"].posebusters_edge_index,
-                        graph["ligand", "lig_edge", "ligand"].lower_bound,
-                        graph["ligand", "lig_edge", "ligand"].upper_bound,
-                        graph["ligand", "lig_edge", "ligand"].posebusters_bond_mask,
-                        graph["ligand", "lig_edge", "ligand"].posebusters_angle_mask,
-                    )
-                )
-                posebusters_metrics.update(
-                    compute_posebusters_interaction_metrics(
-                        lig_pred,
-                        atom_pred,
-                        graph["ligand"].vdw_radii,
-                        graph["atom"].vdw_radii,
-                    )
-                )
-                posebusters_passes = np.all(
-                    np.stack(list(posebusters_metrics.values())), axis=0
-                )
-
-                if posebusters_passes.sum() > 0:
-                    lig_pred, atom_pred = (
-                        lig_pred[posebusters_passes],
-                        atom_pred[posebusters_passes],
-                    )
-                    flexdock_lig_pos, flexdock_atom_pos = (
-                        flexdock_lig_pos[posebusters_passes],
-                        flexdock_atom_pos[posebusters_passes],
-                    )
-                else:
-                    continue
-
-            if not self.cfg.no_rmsd_filtering:
-                R, tr = rigid_transform_kabsch(
-                    atom_pred[:, graph["atom"].nearby_atom_mask],
-                    flexdock_atom_pos[:, graph["atom"].nearby_atom_mask],
-                )
-                lig_pred = lig_pred @ R.swapaxes(-1, -2) + tr.unsqueeze(-2)
-                atom_pred = atom_pred @ R.swapaxes(-1, -2) + tr.unsqueeze(-2)
-                lig_rmsds = torch.mean(
-                    torch.sum((lig_pred - flexdock_lig_pos) ** 2, dim=-1), dim=-1
-                )
-                atom_rmsds = torch.mean(
-                    torch.sum((atom_pred - flexdock_atom_pos) ** 2, dim=-1), dim=-1
-                )
-                rmsds = (lig_rmsds + atom_rmsds) / 2
-                pred_idx = torch.argmin(rmsds).squeeze()
-            else:
-                pred_idx = 0
-
-            relaxation_outputs["ligand_pos"] = lig_pred[pred_idx].cpu().numpy()
-            relaxation_outputs["atom_pos"] = atom_pred[pred_idx].cpu().numpy()
-            relaxation_outputs["success"] = True
+            relaxation_outputs["atom_pos"] = graph["atom"].flexdock_pos[0].cpu().numpy()
+            relaxation_outputs["success"] = False
             relaxation_outputs["run_time"] = time.time() - start_time
             return relaxation_outputs
 
-        relaxation_outputs["ligand_pos"] = graph["ligand"].flexdock_pos[0].cpu().numpy()
-        relaxation_outputs["atom_pos"] = graph["atom"].flexdock_pos[0].cpu().numpy()
-        relaxation_outputs["success"] = False
-        relaxation_outputs["run_time"] = time.time() - start_time
-        return relaxation_outputs
+        except Exception as e:
+            logging.error(
+                f"Could not generate relaxation outputs for {relaxation_outputs['name']} due to {e}",
+                exc_info=True,
+            )
+            return None

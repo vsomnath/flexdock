@@ -907,6 +907,8 @@ class Evaluator:
     def aggregate_relaxation_metrics(
         self, inference_result_dicts, num_workers: int = 1
     ):
+        if not len(inference_result_dicts):
+            return {}
         bust_dfs = []
         with tqdm(total=len(inference_result_dicts)) as pbar:
             with Pool(num_workers) as p:
