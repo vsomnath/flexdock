@@ -60,7 +60,7 @@ See [conda documentation](https://conda.io/projects/conda/en/latest/commands/env
 
 ### Preparing input files
 
-1. Prepare a input CSV similar to `data/inference_pdbbind_5.csv`, with the appropriate columns.
+1. Prepare a input CSV similar to `examples/inference_pdbbind_5.csv`, with the appropriate columns.
 2. Extract ESM embeddings (this manual extraction will be phased out soon).
 (Check Datasets section below for extracting ESM embeddings)
 
